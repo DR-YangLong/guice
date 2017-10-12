@@ -51,7 +51,7 @@ public class Struts2Factory extends ObjectFactory {
 
   private static @com.google.inject.Inject Injector injector;
 
-  private final List<ProvidedInterceptor> interceptors = new ArrayList<ProvidedInterceptor>();
+  private final List<ProvidedInterceptor> interceptors = new ArrayList<>();
   private volatile Injector strutsInjector;
 
   @Override
@@ -67,7 +67,7 @@ public class Struts2Factory extends ObjectFactory {
             + " Please install your module via a GuiceServletContextListener instead.");
   }
 
-  Set<Class<?>> boundClasses = new HashSet<Class<?>>();
+  Set<Class<?>> boundClasses = new HashSet<>();
 
   @Override
   public Class<?> getClassInstance(String name) throws ClassNotFoundException {
@@ -164,6 +164,13 @@ public class Struts2Factory extends ObjectFactory {
     ProvidedInterceptor providedInterceptor =
         new ProvidedInterceptor(interceptorConfig, interceptorRefParams, interceptorClass);
     interceptors.add(providedInterceptor);
+    if (strutsInjector != null) {
+      synchronized (this) {
+        if (strutsInjector != null) {
+          providedInterceptor.inject();
+        }
+      }
+    }
     return providedInterceptor;
   }
 

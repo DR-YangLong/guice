@@ -18,10 +18,11 @@ package com.google.inject.internal;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Objects;
+import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Lists;
+import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.inject.Binder;
@@ -112,7 +113,7 @@ final class InjectorImpl implements Injector, Lookups {
 
   final State state;
   final InjectorImpl parent;
-  final BindingsMultimap bindingsMultimap = new BindingsMultimap();
+  final ListMultimap<TypeLiteral<?>, Binding<?>> bindingsMultimap = ArrayListMultimap.create();
   final InjectorOptions options;
 
   /** Just-in-time binding cache. Guarded by state.lock() */
@@ -136,24 +137,22 @@ final class InjectorImpl implements Injector, Lookups {
       // No ThreadLocal.initialValue(), as that would cause classloader leaks. See
       // https://github.com/google/guice/issues/288#issuecomment-48216933,
       // https://github.com/google/guice/issues/288#issuecomment-48216944
-      localContext = new ThreadLocal<Object[]>();
+      localContext = new ThreadLocal<>();
     }
   }
 
   /** Indexes bindings by type. */
   void index() {
     for (Binding<?> binding : state.getExplicitBindingsThisLevel().values()) {
-      index(binding);
+      bindingsMultimap.put(binding.getKey().getTypeLiteral(), binding);
     }
-  }
-
-  <T> void index(Binding<T> binding) {
-    bindingsMultimap.put(binding.getKey().getTypeLiteral(), binding);
   }
 
   @Override
   public <T> List<Binding<T>> findBindingsByType(TypeLiteral<T> type) {
-    return bindingsMultimap.getAll(type);
+    @SuppressWarnings("unchecked") // safe because we only put matching entries into the map
+    List<Binding<T>> list = (List<Binding<T>>) (List) bindingsMultimap.get(type);
+    return Collections.unmodifiableList(list);
   }
 
   /** Returns the binding for {@code key} */
@@ -805,7 +804,7 @@ final class InjectorImpl implements Injector, Lookups {
     // Look up the target binding.
     final Key<? extends T> targetKey = Key.get(subclass);
     Object source = rawType;
-    FactoryProxy<T> factory = new FactoryProxy<T>(this, key, targetKey, source);
+    FactoryProxy<T> factory = new FactoryProxy<>(this, key, targetKey, source);
     factory.notify(errors); // causes the factory to initialize itself internally
     return new LinkedBindingImpl<T>(
         this,
@@ -966,27 +965,6 @@ final class InjectorImpl implements Injector, Lookups {
     return ImmutableSet.copyOf(state.getConvertersThisLevel());
   }
 
-  private static class BindingsMultimap {
-    final Map<TypeLiteral<?>, List<Binding<?>>> multimap = Maps.newHashMap();
-
-    <T> void put(TypeLiteral<T> type, Binding<T> binding) {
-      List<Binding<?>> bindingsForType = multimap.get(type);
-      if (bindingsForType == null) {
-        bindingsForType = Lists.newArrayList();
-        multimap.put(type, bindingsForType);
-      }
-      bindingsForType.add(binding);
-    }
-
-    @SuppressWarnings("unchecked") // safe because we only put matching entries into the map
-    <T> List<Binding<T>> getAll(TypeLiteral<T> type) {
-      List<Binding<?>> bindings = multimap.get(type);
-      return bindings != null
-          ? Collections.<Binding<T>>unmodifiableList((List) multimap.get(type))
-          : ImmutableList.<Binding<T>>of();
-    }
-  }
-
   /** Returns parameter injectors, or {@code null} if there are no parameters. */
   SingleParameterInjector<?>[] getParametersInjectors(List<Dependency<?>> parameters, Errors errors)
       throws ErrorsException {
@@ -1068,25 +1046,18 @@ final class InjectorImpl implements Injector, Lookups {
     return new Provider<T>() {
       @Override
       public T get() {
-        final Errors errors = new Errors(dependency);
+        Errors errors = new Errors(dependency);
+        InternalContext currentContext = enterContext();
+        Dependency previous = currentContext.pushDependency(dependency, source);
         try {
-          T t =
-              callInContext(
-                  new ContextualCallable<T>() {
-                    @Override
-                    public T call(InternalContext context) throws ErrorsException {
-                      Dependency previous = context.pushDependency(dependency, source);
-                      try {
-                      return internalFactory.get(errors, context, dependency, false);
-                      } finally {
-                        context.popStateAndSetDependency(previous);
-                      }
-                    }
-                  });
+          T t = internalFactory.get(errors, currentContext, dependency, false);
           errors.throwIfNewErrors(0);
           return t;
         } catch (ErrorsException e) {
           throw new ProvisionException(errors.merge(e.getErrors()).getMessages());
+        } finally {
+          currentContext.popStateAndSetDependency(previous);
+          currentContext.close();
         }
       }
 
@@ -1137,25 +1108,35 @@ final class InjectorImpl implements Injector, Lookups {
     return (InternalContext) localContext.get()[0];
   }
 
-  /** Looks up thread local context. Creates (and removes) a new context if necessary. */
-  <T> T callInContext(ContextualCallable<T> callable) throws ErrorsException {
+  /**
+   * Looks up thread local context and {@link InternalContext#enter() enters} it or creates a new
+   * context if necessary.
+   *
+   * <p>All callers of this are responsible for calling {@link InternalContext#close()}. Typical
+   * usage should look like:
+   *
+   * <pre>{@code
+   * InternalContext ctx = injector.enterContext();
+   * try {
+   *   ... use ctx ...
+   * } finally {
+   *   ctx.close();
+   * }
+   * }</pre>
+   */
+  InternalContext enterContext() {
     Object[] reference = localContext.get();
     if (reference == null) {
       reference = new Object[1];
       localContext.set(reference);
     }
-    if (reference[0] == null) {
-      reference[0] = new InternalContext(options);
-      try {
-        return callable.call((InternalContext) reference[0]);
-      } finally {
-        // Only clear contexts if this call created them.
-        reference[0] = null;
-      }
+    InternalContext ctx = (InternalContext) reference[0];
+    if (ctx == null) {
+      reference[0] = ctx = new InternalContext(options, reference);
     } else {
-      // Someone else will clean up this local context.
-      return callable.call((InternalContext) reference[0]);
+      ctx.enter();
     }
+    return ctx;
   }
 
   @Override
